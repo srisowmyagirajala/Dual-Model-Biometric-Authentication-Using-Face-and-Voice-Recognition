@@ -1,0 +1,242 @@
+# Step 1: Mount Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+pip install numpy matplotlib librosa torchaudio facenet-pytorch transformers speechbrain deepface insightface scipy opencv-python mtcnn onnxruntime onnxruntime-gpu
+
+
+import os
+import numpy as np
+import cv2
+import torch
+import torchaudio
+import librosa
+import pickle
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cosine
+from facenet_pytorch import InceptionResnetV1, MTCNN
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+from insightface.app import FaceAnalysis
+from speechbrain.pretrained import SpeakerRecognition
+from google.colab import drive, output
+from IPython.display import display, Javascript
+from base64 import b64decode
+import PIL.Image
+import io
+
+# Initialize models
+mtcnn = MTCNN()
+face_models = {
+    "FaceNet": InceptionResnetV1(pretrained='vggface2').eval(),
+    "ArcFace": FaceAnalysis(name='buffalo_l')
+}
+face_models["ArcFace"].prepare(ctx_id=0, det_size=(640, 640))
+
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-large-960h")
+voice_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").eval()
+voice_recognition = SpeakerRecognition.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_model")
+
+
+# Image enhancement
+def enhance_image(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+def extract_voice_speaker_embedding(audio_path):
+    waveform, sample_rate = torchaudio.load(audio_path)
+    waveform = torch.mean(waveform, dim=0, keepdim=True)
+    target_length = 16000 * 3
+    waveform = waveform[:, :target_length] if waveform.shape[1] > target_length else torch.nn.functional.pad(waveform, (0, target_length - waveform.shape[1]))
+    return voice_recognition.encode_batch(waveform).squeeze().numpy()
+
+
+def extract_face_embedding(img_path, model_name):
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"Error: Unable to read image at {img_path}")
+        return None
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = enhance_image(img)
+
+    if model_name == "ArcFace":
+        faces = face_models[model_name].get(img)
+        return np.array(faces[0].embedding) if faces else None
+
+    elif model_name == "FaceNet":
+        img_cropped = mtcnn(img)
+        if img_cropped is None:  # Ensure a face was detected
+            print(f"⚠ Warning: No face detected in {img_path}")
+            return None
+        return face_models[model_name](img_cropped.unsqueeze(0)).detach().cpu().numpy().flatten()
+
+
+
+# Initialize the face embeddings dictionary
+face_embeddings = {}
+
+# Process and save face embeddings for both FaceNet and ArcFace
+dataset_path = "/content/drive/MyDrive/dataset/faces/"
+for model_name in ["FaceNet", "ArcFace"]:
+    for category in ["unmasked", "masked"]:
+        category_path = os.path.join(dataset_path, category)
+        for person_file in os.listdir(category_path):
+            person_name, _ = os.path.splitext(person_file)
+            img_path = os.path.join(category_path, person_file)
+
+            embedding = extract_face_embedding(img_path, model_name)
+            if embedding is not None:
+                if person_name not in face_embeddings:
+                    face_embeddings[person_name] = {}
+                face_embeddings[person_name][f"{category}_{model_name}"] = embedding.flatten()
+
+# Save the face embeddings to a file
+with open("/content/drive/MyDrive/trained_face_embeddings.pkl", "wb") as f:
+    pickle.dump(face_embeddings, f)
+
+
+# Process and save voice embeddings
+voice_embeddings = {}
+dataset_path = "/content/drive/MyDrive/dataset/voices/"
+for person in os.listdir(dataset_path):
+    person_path = os.path.join(dataset_path, person)
+    if os.path.isdir(person_path):
+        embeddings = [extract_voice_speaker_embedding(os.path.join(person_path, audio_file))
+                      for audio_file in os.listdir(person_path) if audio_file.endswith(".wav")]
+        if embeddings:
+            voice_embeddings[person] = np.mean(embeddings, axis=0)
+with open("/content/drive/MyDrive/trained_voice_embeddings.pkl", "wb") as f:
+    pickle.dump(voice_embeddings, f)
+
+
+# Capture real-time image
+def take_photo():
+    js = Javascript('''
+        async function takePhoto() {
+            const div = document.createElement('div');
+            const video = document.createElement('video');
+            const btn = document.createElement('button');
+            btn.textContent = 'Capture';
+            document.body.appendChild(div);
+            div.appendChild(video);
+            div.appendChild(btn);
+            const stream = await navigator.mediaDevices.getUserMedia({video: true});
+            video.srcObject = stream;
+            await video.play();
+            return new Promise((resolve) => {
+                btn.onclick = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    canvas.getContext('2d').drawImage(video, 0, 0);
+                    stream.getTracks().forEach(track => track.stop());
+                    document.body.removeChild(div);
+                    resolve(canvas.toDataURL('image/jpeg'));
+                };
+            });
+        }
+        takePhoto().then(data => google.colab.kernel.invokeFunction('notebook.capturePhoto', [data], {}));
+    ''')
+    display(js)
+
+def capture_photo_callback(data):
+    img_data = b64decode(data.split(',')[1])
+    with open('/content/photo.jpg', 'wb') as f:
+        f.write(img_data)
+output.register_callback('notebook.capturePhoto',
+capture_photo_callback)
+take_photo()
+
+
+
+import matplotlib.pyplot as plt
+
+# Load and display the captured image
+image_path = "/content/photo.jpg"
+
+try:
+    img = PIL.Image.open(image_path)
+    plt.imshow(img)
+    plt.axis('off')  # Hide axes for better visualization
+    plt.title("Captured Image")
+    plt.show()
+except Exception as e:
+    print(f"Error: {e}")
+
+
+
+# Authentication
+import pickle
+import numpy as np
+from scipy.spatial.distance import cosine
+
+with open("/content/drive/MyDrive/trained_face_embeddings.pkl", "rb") as f:
+    stored_faces = pickle.load(f)
+with open("/content/drive/MyDrive/trained_voice_embeddings.pkl", "rb") as f:
+    stored_voices = pickle.load(f)
+
+
+def normalize_embedding(embedding):
+    return embedding / np.linalg.norm(embedding) if np.linalg.norm(embedding) > 0 else embedding
+
+def authenticate_user(face_embedding, voice_embedding, model_name):
+    best_match = None
+    highest_score = 0
+    best_face_score = 0
+    best_voice_score = 0
+
+    face_embedding = normalize_embedding(face_embedding)
+    voice_embedding = normalize_embedding(voice_embedding)
+
+    for person, face_data in stored_faces.items():
+        if person not in stored_voices:
+            continue  # Skip if no voice data exists for this person
+
+        stored_voice = normalize_embedding(np.array(stored_voices[person]).flatten())
+
+        for category, stored_face in face_data.items():
+            if model_name not in category:
+                continue  # Ensure correct model is used
+
+            stored_face = normalize_embedding(np.array(stored_face).flatten())
+
+            # Compute cosine similarity
+            face_score = 1 - cosine(face_embedding, stored_face)
+            voice_score = 1 - cosine(voice_embedding, stored_voice)
+
+            # Apply stricter voice validation
+            if voice_score < 0.7 or not np.allclose(voice_embedding, stored_voice, atol=0.1):
+                voice_score = 0  # Enforce stricter threshold for voice
+
+            # Biometric fusion (60% face, 40% voice)
+            final_score = (0.6 * face_score) + (0.4 * voice_score)
+
+            if final_score > highest_score:
+                highest_score = final_score
+                best_match = person
+                best_face_score = face_score
+                best_voice_score = voice_score
+
+    if highest_score > 0.80:
+        print(f"✅ {model_name}: Access Granted for {best_match}")
+        print(f"🔹 Face Recognition Accuracy: {best_face_score * 100:.2f}%")
+        print(f"🔹 Voice Recognition Accuracy: {best_voice_score * 100:.2f}%")
+        print(f"🔹 Total Biometric Accuracy: {highest_score * 100:.2f}%")
+    else:
+        print("❌ Access Denied")
+
+# Run authentication for both FaceNet and ArcFace
+face_test_path = "/content/photo.jpg"
+voice_test_path = "/content/drive/MyDrive/test_inputs/03-01-01-01-02-01-22.wav"
+
+# Assuming extract_face_embedding and extract_voice_speaker_embedding are defined elsewhere
+input_face_facenet = normalize_embedding(extract_face_embedding(face_test_path, "FaceNet").flatten())
+input_face_arcface = normalize_embedding(extract_face_embedding(face_test_path, "ArcFace").flatten())
+input_voice = normalize_embedding(extract_voice_speaker_embedding(voice_test_path).flatten())
+
+authenticate_user(input_face_facenet, input_voice, "FaceNet")
+authenticate_user(input_face_arcface, input_voice, "ArcFace")
